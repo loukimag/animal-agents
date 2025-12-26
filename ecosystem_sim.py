@@ -12,6 +12,9 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from matplotlib.lines import Line2D
+import numpy as np
 import pandas as pd
 from mesa import Agent, Model
 from mesa.datacollection import DataCollector
@@ -359,5 +362,256 @@ def run_simulation() -> None:
     plt.savefig("resources_vs_time.png", dpi=150)
 
 
+def _get_agent_positions(model: EcosystemModel):
+    plants_available_x = []
+    plants_available_y = []
+    plants_unavailable_x = []
+    plants_unavailable_y = []
+    prey_x = []
+    prey_y = []
+    predator_x = []
+    predator_y = []
+    competitor_x = []
+    competitor_y = []
+
+    for agent in model.schedule.agents:
+        x, y = agent.pos
+        if isinstance(agent, Plant):
+            if agent.available:
+                plants_available_x.append(x)
+                plants_available_y.append(y)
+            else:
+                plants_unavailable_x.append(x)
+                plants_unavailable_y.append(y)
+        elif isinstance(agent, Prey):
+            prey_x.append(x)
+            prey_y.append(y)
+        elif isinstance(agent, Predator):
+            predator_x.append(x)
+            predator_y.append(y)
+        elif isinstance(agent, Competitor):
+            competitor_x.append(x)
+            competitor_y.append(y)
+
+    return {
+        "plants_available": (plants_available_x, plants_available_y),
+        "plants_unavailable": (plants_unavailable_x, plants_unavailable_y),
+        "prey": (prey_x, prey_y),
+        "predators": (predator_x, predator_y),
+        "competitors": (competitor_x, competitor_y),
+    }
+
+
+def run_visual_simulation(
+    max_steps: int = 500,
+    show_population_plot: bool = True,
+) -> None:
+    model = EcosystemModel(max_steps=max_steps)
+
+    grid_figsize = (6, 6)
+    if show_population_plot:
+        fig, (ax_grid, ax_pop) = plt.subplots(1, 2, figsize=(11, 5))
+    else:
+        fig, ax_grid = plt.subplots(1, 1, figsize=grid_figsize)
+        ax_pop = None
+
+    ax_grid.set_xlim(-0.5, model.grid.width - 0.5)
+    ax_grid.set_ylim(-0.5, model.grid.height - 0.5)
+    ax_grid.set_aspect("equal")
+    ax_grid.set_title("Ecosystem Grid")
+    ax_grid.set_xticks([])
+    ax_grid.set_yticks([])
+
+    # Plant squares
+    plants_available = ax_grid.scatter(
+        [],
+        [],
+        marker="s",
+        s=35,
+        c="#5cb85c",
+        label="Plants (available)",
+        linewidths=0,
+    )
+    plants_unavailable = ax_grid.scatter(
+        [],
+        [],
+        marker="s",
+        s=35,
+        c="#2f7d32",
+        label="Plants (unavailable)",
+        linewidths=0,
+    )
+
+    # Animal circles
+    prey_scatter = ax_grid.scatter(
+        [],
+        [],
+        marker="o",
+        s=45,
+        c="#2b6cb0",
+        label="Prey",
+        linewidths=0,
+    )
+    predator_scatter = ax_grid.scatter(
+        [],
+        [],
+        marker="o",
+        s=50,
+        c="#c9302c",
+        label="Predators",
+        linewidths=0,
+    )
+    competitor_scatter = ax_grid.scatter(
+        [],
+        [],
+        marker="o",
+        s=45,
+        c="#f0ad4e",
+        label="Competitors",
+        linewidths=0,
+    )
+
+    legend_handles = [
+        Line2D([0], [0], marker="s", color="w", label="Plants (available)",
+               markerfacecolor="#5cb85c", markersize=8),
+        Line2D([0], [0], marker="s", color="w", label="Plants (unavailable)",
+               markerfacecolor="#2f7d32", markersize=8),
+        Line2D([0], [0], marker="o", color="w", label="Prey",
+               markerfacecolor="#2b6cb0", markersize=8),
+        Line2D([0], [0], marker="o", color="w", label="Predators",
+               markerfacecolor="#c9302c", markersize=8),
+        Line2D([0], [0], marker="o", color="w", label="Competitors",
+               markerfacecolor="#f0ad4e", markersize=8),
+    ]
+    ax_grid.legend(handles=legend_handles, loc="upper right", fontsize=8)
+
+    counter_text = ax_grid.text(
+        0.02,
+        0.98,
+        "",
+        transform=ax_grid.transAxes,
+        va="top",
+        ha="left",
+        fontsize=9,
+        bbox=dict(facecolor="white", alpha=0.7, edgecolor="none"),
+    )
+
+    if ax_pop:
+        ax_pop.set_title("Population Over Time")
+        ax_pop.set_xlabel("Step")
+        ax_pop.set_ylabel("Count")
+        pop_lines = {
+            "prey": ax_pop.plot([], [], color="#2b6cb0", label="Prey")[0],
+            "predators": ax_pop.plot([], [], color="#c9302c", label="Predators")[0],
+            "competitors": ax_pop.plot([], [], color="#f0ad4e", label="Competitors")[0],
+        }
+        ax_pop.legend(loc="upper right", fontsize=8)
+        pop_history = {"step": [], "prey": [], "predators": [], "competitors": []}
+
+    def _to_offsets(points):
+        if points[0]:
+            return np.column_stack(points)
+        return np.empty((0, 2))
+
+    def init():
+        plants_available.set_offsets(np.empty((0, 2)))
+        plants_unavailable.set_offsets(np.empty((0, 2)))
+        prey_scatter.set_offsets(np.empty((0, 2)))
+        predator_scatter.set_offsets(np.empty((0, 2)))
+        competitor_scatter.set_offsets(np.empty((0, 2)))
+        counter_text.set_text("")
+        if ax_pop:
+            for line in pop_lines.values():
+                line.set_data([], [])
+        return (
+            plants_available,
+            plants_unavailable,
+            prey_scatter,
+            predator_scatter,
+            competitor_scatter,
+            counter_text,
+        )
+
+    def update(_frame):
+        model.step()
+        positions = _get_agent_positions(model)
+
+        plants_available.set_offsets(_to_offsets(positions["plants_available"]))
+        plants_unavailable.set_offsets(_to_offsets(positions["plants_unavailable"]))
+        prey_scatter.set_offsets(_to_offsets(positions["prey"]))
+        predator_scatter.set_offsets(_to_offsets(positions["predators"]))
+        competitor_scatter.set_offsets(_to_offsets(positions["competitors"]))
+
+        prey_count = model.count_species(Prey)
+        predator_count = model.count_species(Predator)
+        competitor_count = model.count_species(Competitor)
+        plant_count = model.count_plants_available()
+        counter_text.set_text(
+            f"Step: {model.schedule.steps}\n"
+            f"Plants: {plant_count}\n"
+            f"Prey: {prey_count}\n"
+            f"Predators: {predator_count}\n"
+            f"Competitors: {competitor_count}"
+        )
+
+        if ax_pop:
+            pop_history["step"].append(model.schedule.steps)
+            pop_history["prey"].append(prey_count)
+            pop_history["predators"].append(predator_count)
+            pop_history["competitors"].append(competitor_count)
+            for name, line in pop_lines.items():
+                line.set_data(pop_history["step"], pop_history[name])
+            ax_pop.relim()
+            ax_pop.autoscale_view()
+
+        return (
+            plants_available,
+            plants_unavailable,
+            prey_scatter,
+            predator_scatter,
+            competitor_scatter,
+            counter_text,
+        )
+
+    anim = FuncAnimation(
+        fig,
+        update,
+        init_func=init,
+        frames=max_steps,
+        interval=150,
+        blit=False,
+        repeat=False,
+    )
+    plt.tight_layout()
+    plt.show()
+
+
 if __name__ == "__main__":
-    run_simulation()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Ecosystem simulation")
+    parser.add_argument(
+        "--visual",
+        action="store_true",
+        help="Run a real-time visualization instead of batch mode.",
+    )
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=500,
+        help="Number of steps to animate in visual mode.",
+    )
+    parser.add_argument(
+        "--no-pop-plot",
+        action="store_true",
+        help="Disable the live population plot in visual mode.",
+    )
+    args = parser.parse_args()
+
+    if args.visual:
+        run_visual_simulation(
+            max_steps=args.steps,
+            show_population_plot=not args.no_pop_plot,
+        )
+    else:
+        run_simulation()
