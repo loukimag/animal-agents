@@ -112,6 +112,66 @@ class BaseAnimal(Agent):
         new_position = self.model.random.choice(possible_steps)
         self.model.grid.move_agent(self, new_position)
 
+    def _torus_distance(self, a, b) -> int:
+        dx = abs(a[0] - b[0])
+        dy = abs(a[1] - b[1])
+        dx = min(dx, self.model.grid.width - dx)
+        dy = min(dy, self.model.grid.height - dy)
+        return max(dx, dy)
+
+    def _local_sense(self, pos, vision: int):
+        neighborhood = self.model.grid.get_neighborhood(
+            pos, moore=True, include_center=True, radius=vision
+        )
+        counts = {"plants": 0, "prey": 0, "predators": 0}
+        nearest = {"plants": None, "prey": None, "predators": None}
+        for npos in neighborhood:
+            contents = self.model.grid.get_cell_list_contents([npos])
+            if not contents:
+                continue
+            dist = self._torus_distance(pos, npos)
+            for obj in contents:
+                if isinstance(obj, Plant) and obj.available:
+                    counts["plants"] += 1
+                    if nearest["plants"] is None or dist < nearest["plants"]:
+                        nearest["plants"] = dist
+                elif isinstance(obj, Prey):
+                    counts["prey"] += 1
+                    if nearest["prey"] is None or dist < nearest["prey"]:
+                        nearest["prey"] = dist
+                elif isinstance(obj, Predator):
+                    counts["predators"] += 1
+                    if nearest["predators"] is None or dist < nearest["predators"]:
+                        nearest["predators"] = dist
+        return counts, nearest
+
+    def _move_with_scoring(
+        self,
+        radius: int,
+        vision: int,
+        score_fn,
+        allow_stay: bool = True,
+    ) -> None:
+        candidates = self.model.grid.get_neighborhood(
+            self.pos, moore=True, include_center=allow_stay, radius=radius
+        )
+        best_score = None
+        best_positions = []
+        for pos in candidates:
+            counts, nearest = self._local_sense(pos, vision=vision)
+            score = score_fn(counts, nearest)
+            if best_score is None or score > best_score:
+                best_score = score
+                best_positions = [pos]
+            elif score == best_score:
+                best_positions.append(pos)
+        if not best_positions:
+            return
+        new_position = self.model.random.choice(best_positions)
+        if new_position != self.pos:
+            self.energy -= self.params.move_cost
+            self.model.grid.move_agent(self, new_position)
+
     def _eat(self) -> None:
         # Override in subclasses
         return
@@ -141,6 +201,41 @@ class BaseAnimal(Agent):
 class Prey(BaseAnimal):
     species_name = "prey"
 
+    def _move(self) -> None:
+        def score(counts, nearest):
+            plant_bonus = counts["plants"] * 2
+            predator_penalty = counts["predators"] * 8
+            if nearest["plants"] is not None:
+                plant_bonus += max(0, 4 - nearest["plants"]) * 2
+            if nearest["predators"] is not None:
+                predator_penalty += max(0, 7 - nearest["predators"]) * 8
+                # Favor positions that increase distance from predators.
+                plant_bonus += min(6, nearest["predators"]) * 2
+            return plant_bonus - predator_penalty
+
+        # Panic mode: larger radius when predators are close.
+        base_radius = 4
+        base_vision = 4
+        _, nearest = self._local_sense(self.pos, vision=base_vision)
+        panic = nearest["predators"] is not None and nearest["predators"] <= 2
+        if panic:
+            base_radius = 6
+            base_vision = 6
+        self._move_with_scoring(
+            radius=base_radius,
+            vision=base_vision,
+            score_fn=score,
+            allow_stay=True,
+        )
+        # Extra burst move during panic to flee faster.
+        if panic:
+            self._move_with_scoring(
+                radius=4,
+                vision=4,
+                score_fn=score,
+                allow_stay=False,
+            )
+
     def _eat(self) -> None:
         cellmates = self.model.grid.get_cell_list_contents([self.pos])
         for obj in cellmates:
@@ -148,9 +243,44 @@ class Prey(BaseAnimal):
                 self.energy += self.params.eat_gain
                 return
 
+    def _attempt_reproduce(self) -> None:
+        predator_count = self.model.count_species(Predator)
+        prey_count = self.model.count_species(Prey)
+        if prey_count >= 300:
+            if self.cooldown > 0:
+                self.cooldown -= 1
+            return
+        if predator_count > 0 and prey_count > int(predator_count * 1.2):
+            if self.cooldown > 0:
+                self.cooldown -= 1
+            return
+        dynamic_threshold = self.params.reproduce_threshold
+        if prey_count <= 200:
+            dynamic_threshold = max(1, self.params.reproduce_threshold - 2)
+        if self.cooldown > 0:
+            self.cooldown -= 1
+            return
+        if self.energy >= dynamic_threshold:
+            self.energy -= self.params.reproduce_cost
+            self.cooldown = self.params.reproduce_cooldown
+            self.gestation_queue.append(self.params.gestation_delay)
+
 
 class Predator(BaseAnimal):
     species_name = "predator"
+
+    def _move(self) -> None:
+        def score(counts, nearest):
+            prey_bonus = counts["prey"] * 1
+            crowd_penalty = counts["predators"] * 2
+            if nearest["prey"] is not None:
+                prey_bonus += max(0, 2 - nearest["prey"]) * 1
+            if nearest["predators"] is not None:
+                crowd_penalty += max(0, 3 - nearest["predators"]) * 1
+            return prey_bonus - crowd_penalty
+
+        # Shorter vision and weaker scoring makes predators less effective.
+        self._move_with_scoring(radius=2, vision=2, score_fn=score, allow_stay=True)
 
     def _eat(self) -> None:
         cellmates = self.model.grid.get_cell_list_contents([self.pos])
@@ -161,9 +291,52 @@ class Predator(BaseAnimal):
             self.model.schedule.remove(prey)
             self.energy += self.params.eat_gain
 
+    def _attempt_reproduce(self) -> None:
+        # Prevent predator growth when prey are scarce or below parity.
+        prey_count = self.model.count_species(Prey)
+        predator_count = self.model.count_species(Predator)
+        if predator_count >= 300:
+            if self.cooldown > 0:
+                self.cooldown -= 1
+            return
+        if prey_count < 10 or prey_count < predator_count:
+            if self.cooldown > 0:
+                self.cooldown -= 1
+            return
+        dynamic_threshold = self.params.reproduce_threshold
+        if predator_count <= 200:
+            dynamic_threshold = max(1, self.params.reproduce_threshold - 2)
+        if self.cooldown > 0:
+            self.cooldown -= 1
+            return
+        if self.energy >= dynamic_threshold:
+            self.energy -= self.params.reproduce_cost
+            self.cooldown = self.params.reproduce_cooldown
+            self.gestation_queue.append(self.params.gestation_delay)
+
+    def _age(self) -> None:
+        prey_count = self.model.count_species(Prey)
+        if prey_count < 100:
+            self.energy -= 4
+        elif prey_count < 200:
+            self.energy -= 2
+        super()._age()
+
 
 class Competitor(BaseAnimal):
     species_name = "competitor"
+
+    def _move(self) -> None:
+        def score(counts, nearest):
+            plant_bonus = counts["plants"] * 2
+            predator_penalty = counts["predators"] * 2
+            if nearest["plants"] is not None:
+                plant_bonus += max(0, 4 - nearest["plants"]) * 2
+            if nearest["predators"] is not None:
+                predator_penalty += max(0, 4 - nearest["predators"]) * 2
+            return plant_bonus - predator_penalty
+
+        self._move_with_scoring(radius=4, vision=4, score_fn=score, allow_stay=True)
 
     def _eat(self) -> None:
         cellmates = self.model.grid.get_cell_list_contents([self.pos])
@@ -176,16 +349,16 @@ class Competitor(BaseAnimal):
 class EcosystemModel(Model):
     def __init__(
         self,
-        width: int = 25,
-        height: int = 25,
-        initial_plants: int = 200,
-        initial_prey: int = 60,
-        initial_predators: int = 25,
-        plant_regrow_delay: int = 12,
+        width: int = 60,
+        height: int = 60,
+        initial_plants: int = 480,
+        initial_prey: int = 180,
+        initial_predators: int = 120,
+        plant_regrow_delay: int = 5,
         prey_params: Optional[SpeciesParams] = None,
         predator_params: Optional[SpeciesParams] = None,
         competitor_params: Optional[SpeciesParams] = None,
-        competitor_intro_step: int = 200,
+        competitor_intro_step: int = 30,
         initial_competitors: int = 30,
         seed: Optional[int] = 42,
         max_steps: int = 2000,
@@ -202,34 +375,34 @@ class EcosystemModel(Model):
         self.extinction_step: Dict[str, int] = {}
 
         self.prey_params = prey_params or SpeciesParams(
-            initial_energy=12,
+            initial_energy=30,
             move_cost=1,
-            eat_gain=4,
-            reproduce_threshold=18,
-            reproduce_cost=6,
-            reproduce_cooldown=6,
-            gestation_delay=4,
-            offspring_energy=8,
+            eat_gain=14,
+            reproduce_threshold=11,
+            reproduce_cost=2,
+            reproduce_cooldown=3,
+            gestation_delay=3,
+            offspring_energy=18,
         )
         self.predator_params = predator_params or SpeciesParams(
-            initial_energy=15,
+            initial_energy=30,
             move_cost=1,
-            eat_gain=8,
-            reproduce_threshold=22,
-            reproduce_cost=8,
-            reproduce_cooldown=8,
-            gestation_delay=6,
-            offspring_energy=10,
+            eat_gain=18,
+            reproduce_threshold=18,
+            reproduce_cost=4,
+            reproduce_cooldown=5,
+            gestation_delay=3,
+            offspring_energy=18,
         )
         self.competitor_params = competitor_params or SpeciesParams(
-            initial_energy=10,
+            initial_energy=20,
             move_cost=1,
-            eat_gain=5,
-            reproduce_threshold=16,
-            reproduce_cost=6,
-            reproduce_cooldown=4,
-            gestation_delay=3,
-            offspring_energy=7,
+            eat_gain=10,
+            reproduce_threshold=12,
+            reproduce_cost=2,
+            reproduce_cooldown=3,
+            gestation_delay=2,
+            offspring_energy=14,
         )
 
         self._init_plants(initial_plants, plant_regrow_delay)
@@ -242,6 +415,9 @@ class EcosystemModel(Model):
                 "prey": lambda m: m.count_species(Prey),
                 "predators": lambda m: m.count_species(Predator),
                 "competitors": lambda m: m.count_species(Competitor),
+                "prey_health": lambda m: m.average_energy(Prey),
+                "predator_health": lambda m: m.average_energy(Predator),
+                "competitor_health": lambda m: m.average_energy(Competitor),
             }
         )
 
@@ -288,6 +464,12 @@ class EcosystemModel(Model):
             for a in self.schedule.agents
             if isinstance(a, Plant) and a.available
         )
+
+    def average_energy(self, species_cls: type) -> float:
+        energies = [a.energy for a in self.schedule.agents if isinstance(a, species_cls)]
+        if not energies:
+            return 0.0
+        return float(sum(energies) / len(energies))
 
     def register_extinction(self, species_name: str) -> None:
         if species_name not in self.extinction_step:
@@ -351,6 +533,17 @@ def run_simulation() -> None:
     plt.legend()
     plt.tight_layout()
     plt.savefig("population_vs_time.png", dpi=150)
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(df["step"], df["prey_health"], label="Prey Health")
+    plt.plot(df["step"], df["predator_health"], label="Predator Health")
+    plt.plot(df["step"], df["competitor_health"], label="Competitor Health")
+    plt.title("Average Energy (Health) vs Time")
+    plt.xlabel("Step")
+    plt.ylabel("Average Energy")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("health_vs_time.png", dpi=150)
 
     plt.figure(figsize=(10, 4))
     plt.plot(df["step"], df["plants_available"], color="green", label="Plants")
@@ -505,8 +698,42 @@ def run_visual_simulation(
             "predators": ax_pop.plot([], [], color="#c9302c", label="Predators")[0],
             "competitors": ax_pop.plot([], [], color="#f0ad4e", label="Competitors")[0],
         }
+        ax_health = ax_pop.twinx()
+        ax_health.set_ylabel("Avg Energy")
+        health_lines = {
+            "prey_health": ax_health.plot(
+                [],
+                [],
+                color="#2b6cb0",
+                linestyle="--",
+                label="Prey Health",
+            )[0],
+            "predator_health": ax_health.plot(
+                [],
+                [],
+                color="#c9302c",
+                linestyle="--",
+                label="Predator Health",
+            )[0],
+            "competitor_health": ax_health.plot(
+                [],
+                [],
+                color="#f0ad4e",
+                linestyle="--",
+                label="Competitor Health",
+            )[0],
+        }
         ax_pop.legend(loc="upper right", fontsize=8)
-        pop_history = {"step": [], "prey": [], "predators": [], "competitors": []}
+        ax_health.legend(loc="lower right", fontsize=8)
+        pop_history = {
+            "step": [],
+            "prey": [],
+            "predators": [],
+            "competitors": [],
+            "prey_health": [],
+            "predator_health": [],
+            "competitor_health": [],
+        }
 
     def _to_offsets(points):
         if points[0]:
@@ -522,6 +749,8 @@ def run_visual_simulation(
         counter_text.set_text("")
         if ax_pop:
             for line in pop_lines.values():
+                line.set_data([], [])
+            for line in health_lines.values():
                 line.set_data([], [])
         return (
             plants_available,
@@ -561,8 +790,15 @@ def run_visual_simulation(
             pop_history["competitors"].append(competitor_count)
             for name, line in pop_lines.items():
                 line.set_data(pop_history["step"], pop_history[name])
+            pop_history["prey_health"].append(model.average_energy(Prey))
+            pop_history["predator_health"].append(model.average_energy(Predator))
+            pop_history["competitor_health"].append(model.average_energy(Competitor))
+            for name, line in health_lines.items():
+                line.set_data(pop_history["step"], pop_history[name])
             ax_pop.relim()
             ax_pop.autoscale_view()
+            ax_health.relim()
+            ax_health.autoscale_view()
 
         return (
             plants_available,
