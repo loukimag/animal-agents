@@ -226,6 +226,10 @@ class BaseAnimal(Agent):
         if self.cooldown > 0:
             self.cooldown -= 1
             return
+        if self.model.total_population() >= self.model.max_population:
+            return
+        if self.model.count_species(self.__class__) >= self.model.max_population_per_species:
+            return
         if self.energy >= self.params.reproduce_threshold:
             self.energy -= self.params.reproduce_cost
             self.cooldown = self.params.reproduce_cooldown
@@ -365,6 +369,10 @@ class Prey(BaseAnimal):
     def _attempt_reproduce(self) -> None:
         predator_count = self.model.count_species(Predator)
         prey_count = self.model.count_species(Prey)
+        if self.model.total_population() >= self.model.max_population:
+            return
+        if prey_count >= self.model.max_population_per_species:
+            return
         if prey_count >= 300:
             if self.cooldown > 0:
                 self.cooldown -= 1
@@ -427,6 +435,10 @@ class Predator(BaseAnimal):
         # Prevent predator growth when prey are scarce or below parity.
         prey_count = self.model.count_species(Prey)
         predator_count = self.model.count_species(Predator)
+        if self.model.total_population() >= self.model.max_population:
+            return
+        if predator_count >= self.model.max_population_per_species:
+            return
         if predator_count >= 300:
             if self.cooldown > 0:
                 self.cooldown -= 1
@@ -502,6 +514,8 @@ class EcosystemModel(Model):
         learning_enabled: bool = True,
         seed: Optional[int] = 42,
         max_steps: int = 2000,
+        max_population: Optional[int] = None,
+        max_population_per_species: Optional[int] = None,
     ):
         super().__init__()
         self.random = random.Random(seed)
@@ -520,6 +534,8 @@ class EcosystemModel(Model):
         self.initial_competitors = initial_competitors
         self.initial_plants = initial_plants
         self.extinction_step: Dict[str, int] = {}
+        self.max_population = max_population or int(width * height * 4)
+        self.max_population_per_species = max_population_per_species or 500
         self.learning_params = {
             "prey": LearningParams(
                 enabled=learning_enabled,
@@ -671,6 +687,13 @@ class EcosystemModel(Model):
 
     def count_species(self, species_cls: type) -> int:
         return sum(1 for a in self.schedule.agents if isinstance(a, species_cls))
+
+    def total_population(self) -> int:
+        return sum(
+            1
+            for a in self.schedule.agents
+            if isinstance(a, (Prey, Predator, Competitor))
+        )
 
     def count_plants_available(self) -> int:
         return sum(
