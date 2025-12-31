@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
@@ -49,6 +49,19 @@ TERRAIN_REGROW_MULT = {
 }
 
 EAT_RADIUS = 1.2
+MOVE_MODES = ("forage", "flee", "wander", "rest")
+
+
+@dataclass
+class LearningParams:
+    enabled: bool
+    alpha: float
+    gamma: float
+    epsilon: float
+    survival_reward: float
+    move_penalty: float
+    death_penalty: float
+    vision: int
 
 
 class SimpleScheduler:
@@ -107,9 +120,13 @@ class BaseAnimal(Agent):
         self.gestation_queue: List[int] = []
 
     def step(self) -> None:
+        prev_energy = self.energy
+        self._moved = False
         self._handle_gestation()
-        self._move()
+        mode, mode_weights = self._select_mode()
+        self._move(mode=mode, mode_weights=mode_weights)
         self._eat()
+        self._apply_learning_reward(prev_energy)
         self._attempt_reproduce()
         self._age()
 
@@ -122,7 +139,7 @@ class BaseAnimal(Agent):
             self.gestation_queue.pop(0)
             self._spawn_offspring()
 
-    def _move(self) -> None:
+    def _move(self, mode: str = "heuristic", mode_weights: Optional[Dict[str, float]] = None) -> None:
         angle = self.model.random.random() * 2 * np.pi
         distance = self.model.random.random()
         new_position = (
@@ -130,6 +147,7 @@ class BaseAnimal(Agent):
             self.pos[1] + np.sin(angle) * distance,
         )
         new_position = self.model.space.torus_adj(new_position)
+        self._moved = new_position != self.pos
         self.energy -= self.params.move_cost + self.model.terrain_move_cost(new_position)
         self.model.space.move_agent(self, new_position)
 
@@ -196,6 +214,7 @@ class BaseAnimal(Agent):
             return
         new_position = self.model.random.choice(best_positions)
         if new_position != self.pos:
+            self._moved = True
             self.energy -= self.params.move_cost + self.model.terrain_move_cost(new_position)
             self.model.space.move_agent(self, new_position)
 
@@ -218,26 +237,93 @@ class BaseAnimal(Agent):
         self.model.space.place_agent(offspring, self.pos)
         self.model.schedule.add(offspring)
 
-    def _age(self) -> None:
+    def _age(self) -> bool:
         if self.energy <= 0:
+            self._learning_update(reward=-self.model.death_penalty(self.species_name), done=True)
             self.model.space.remove_agent(self)
             self.model.schedule.remove(self)
             self.model.register_extinction(self.species_name)
+            return False
+        return True
+
+    def _select_mode(self) -> Tuple[str, Optional[Dict[str, float]]]:
+        params = self.model.learning_params.get(self.species_name)
+        if not params or not params.enabled:
+            return "heuristic", None
+        state = self._learning_state(params.vision)
+        self._last_state = state
+        q_table = self.model.q_tables[self.species_name]
+        if self.model.random.random() < params.epsilon:
+            action = self.model.random.choice(MOVE_MODES)
+        else:
+            q_values = {a: q_table.get((state, a), 0.0) for a in MOVE_MODES}
+            best = max(q_values.values())
+            best_actions = [a for a, v in q_values.items() if v == best]
+            action = self.model.random.choice(best_actions)
+        self._last_action = action
+        return action, self.model.mode_weights[self.species_name].get(action)
+
+    def _learning_state(self, vision: int) -> Tuple[int, int, int, int]:
+        counts, nearest = self._local_sense(self.pos, vision=vision)
+        if self.species_name == "predator":
+            food_count = counts["prey"]
+            threat_count = counts["predators"]
+            dist_key = nearest["prey"]
+        else:
+            food_count = counts["plants"]
+            threat_count = counts["predators"]
+            dist_key = nearest["predators"]
+        energy_bin = 0 if self.energy < 10 else 1 if self.energy < 20 else 2
+        food_bin = 0 if food_count == 0 else 1 if food_count < 3 else 2
+        threat_bin = 0 if threat_count == 0 else 1 if threat_count < 2 else 2
+        dist_bin = 0 if dist_key is None else 1 if dist_key <= 2 else 2
+        return (energy_bin, food_bin, threat_bin, dist_bin)
+
+    def _apply_learning_reward(self, prev_energy: float) -> None:
+        params = self.model.learning_params.get(self.species_name)
+        if not params or not params.enabled:
+            return
+        reward = self.energy - prev_energy
+        if self._moved:
+            reward -= params.move_penalty
+        reward += params.survival_reward
+        self._learning_update(reward=reward, done=False)
+
+    def _learning_update(self, reward: float, done: bool) -> None:
+        params = self.model.learning_params.get(self.species_name)
+        if not params or not params.enabled:
+            return
+        if not hasattr(self, "_last_state") or not hasattr(self, "_last_action"):
+            return
+        q_table = self.model.q_tables[self.species_name]
+        state = self._last_state
+        action = self._last_action
+        current = q_table.get((state, action), 0.0)
+        next_state = self._learning_state(params.vision)
+        next_q = max(q_table.get((next_state, a), 0.0) for a in MOVE_MODES)
+        target = reward if done else reward + params.gamma * next_q
+        q_table[(state, action)] = current + params.alpha * (target - current)
 
 
 class Prey(BaseAnimal):
     species_name = "prey"
 
-    def _move(self) -> None:
+    def _move(self, mode: str = "heuristic", mode_weights: Optional[Dict[str, float]] = None) -> None:
+        weights = mode_weights or {}
+        plant_mult = weights.get("plant_mult", 1.0)
+        predator_mult = weights.get("predator_mult", 1.0)
+        radius = weights.get("radius", 4)
+        vision = weights.get("vision", 4)
+
         def score(counts, nearest, terrain):
-            plant_bonus = counts["plants"] * 2
-            predator_penalty = counts["predators"] * 8
+            plant_bonus = counts["plants"] * 2 * plant_mult
+            predator_penalty = counts["predators"] * 8 * predator_mult
             if nearest["plants"] is not None:
-                plant_bonus += max(0, 4 - nearest["plants"]) * 2
+                plant_bonus += max(0, 4 - nearest["plants"]) * 2 * plant_mult
             if nearest["predators"] is not None:
-                predator_penalty += max(0, 7 - nearest["predators"]) * 8
+                predator_penalty += max(0, 7 - nearest["predators"]) * 8 * predator_mult
                 # Favor positions that increase distance from predators.
-                plant_bonus += min(6, nearest["predators"]) * 2
+                plant_bonus += min(6, nearest["predators"]) * 2 * predator_mult
             terrain_bonus = 0
             if terrain == "forest":
                 terrain_bonus += 2
@@ -246,13 +332,13 @@ class Prey(BaseAnimal):
             return plant_bonus - predator_penalty + terrain_bonus
 
         # Panic mode: larger radius when predators are close.
-        base_radius = 4
-        base_vision = 4
+        base_radius = radius
+        base_vision = vision
         _, nearest = self._local_sense(self.pos, vision=base_vision)
         panic = nearest["predators"] is not None and nearest["predators"] <= 2
         if panic:
-            base_radius = 6
-            base_vision = 6
+            base_radius = max(base_radius, 6)
+            base_vision = max(base_vision, 6)
         self._move_with_scoring(
             radius=base_radius,
             vision=base_vision,
@@ -302,14 +388,20 @@ class Prey(BaseAnimal):
 class Predator(BaseAnimal):
     species_name = "predator"
 
-    def _move(self) -> None:
+    def _move(self, mode: str = "heuristic", mode_weights: Optional[Dict[str, float]] = None) -> None:
+        weights = mode_weights or {}
+        prey_mult = weights.get("prey_mult", 1.0)
+        crowd_mult = weights.get("crowd_mult", 1.0)
+        radius = weights.get("radius", 2)
+        vision = weights.get("vision", 2)
+
         def score(counts, nearest, terrain):
-            prey_bonus = counts["prey"] * 1
-            crowd_penalty = counts["predators"] * 2
+            prey_bonus = counts["prey"] * 1 * prey_mult
+            crowd_penalty = counts["predators"] * 2 * crowd_mult
             if nearest["prey"] is not None:
-                prey_bonus += max(0, 2 - nearest["prey"]) * 1
+                prey_bonus += max(0, 2 - nearest["prey"]) * 1 * prey_mult
             if nearest["predators"] is not None:
-                crowd_penalty += max(0, 3 - nearest["predators"]) * 1
+                crowd_penalty += max(0, 3 - nearest["predators"]) * 1 * crowd_mult
             terrain_bonus = 0
             if terrain == "forest":
                 terrain_bonus -= 1
@@ -318,7 +410,7 @@ class Predator(BaseAnimal):
             return prey_bonus - crowd_penalty + terrain_bonus
 
         # Shorter vision and weaker scoring makes predators less effective.
-        self._move_with_scoring(radius=2, vision=2, score_fn=score, allow_stay=True)
+        self._move_with_scoring(radius=radius, vision=vision, score_fn=score, allow_stay=True)
 
     def _eat(self) -> None:
         neighbors = self.model.space.get_neighbors(self.pos, radius=EAT_RADIUS, include_center=True)
@@ -366,7 +458,7 @@ class Predator(BaseAnimal):
 class Competitor(BaseAnimal):
     species_name = "competitor"
 
-    def _move(self) -> None:
+    def _move(self, mode: str = "heuristic", mode_weights: Optional[Dict[str, float]] = None) -> None:
         def score(counts, nearest, terrain):
             plant_bonus = counts["plants"] * 2
             predator_penalty = counts["predators"] * 2
@@ -407,6 +499,7 @@ class EcosystemModel(Model):
         competitor_intro_step: int = 30,
         initial_competitors: int = 30,
         terrain_weights: Optional[Dict[str, float]] = None,
+        learning_enabled: bool = True,
         seed: Optional[int] = 42,
         max_steps: int = 2000,
     ):
@@ -427,6 +520,46 @@ class EcosystemModel(Model):
         self.initial_competitors = initial_competitors
         self.initial_plants = initial_plants
         self.extinction_step: Dict[str, int] = {}
+        self.learning_params = {
+            "prey": LearningParams(
+                enabled=learning_enabled,
+                alpha=0.2,
+                gamma=0.8,
+                epsilon=0.2,
+                survival_reward=0.2,
+                move_penalty=0.1,
+                death_penalty=20.0,
+                vision=4,
+            ),
+            "predator": LearningParams(
+                enabled=learning_enabled,
+                alpha=0.1,
+                gamma=0.8,
+                epsilon=0.1,
+                survival_reward=0.1,
+                move_penalty=0.1,
+                death_penalty=20.0,
+                vision=3,
+            ),
+        }
+        self.q_tables: Dict[str, Dict[Tuple[Tuple[int, int, int, int], str], float]] = {
+            "prey": {},
+            "predator": {},
+        }
+        self.mode_weights = {
+            "prey": {
+                "forage": {"plant_mult": 1.5, "predator_mult": 1.0, "radius": 4, "vision": 4},
+                "flee": {"plant_mult": 0.8, "predator_mult": 1.8, "radius": 6, "vision": 6},
+                "wander": {"plant_mult": 1.0, "predator_mult": 0.8, "radius": 5, "vision": 3},
+                "rest": {"plant_mult": 0.6, "predator_mult": 1.4, "radius": 2, "vision": 2},
+            },
+            "predator": {
+                "forage": {"prey_mult": 1.6, "crowd_mult": 1.0, "radius": 3, "vision": 3},
+                "flee": {"prey_mult": 0.8, "crowd_mult": 1.5, "radius": 2, "vision": 2},
+                "wander": {"prey_mult": 1.0, "crowd_mult": 1.0, "radius": 3, "vision": 2},
+                "rest": {"prey_mult": 0.7, "crowd_mult": 1.2, "radius": 1, "vision": 1},
+            },
+        }
 
         self.prey_params = prey_params or SpeciesParams(
             initial_energy=30,
@@ -545,6 +678,10 @@ class EcosystemModel(Model):
             for a in self.schedule.agents
             if isinstance(a, Plant) and a.available
         )
+
+    def death_penalty(self, species_name: str) -> float:
+        params = self.learning_params.get(species_name)
+        return params.death_penalty if params else 0.0
 
     def average_energy(self, species_cls: type) -> float:
         energies = [a.energy for a in self.schedule.agents if isinstance(a, species_cls)]
