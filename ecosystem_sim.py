@@ -64,6 +64,28 @@ class LearningParams:
     vision: int
 
 
+@dataclass
+class SimulationConfig:
+    width: int = 60
+    height: int = 60
+    initial_plants: int = 480
+    initial_prey: int = 180
+    initial_predators: int = 120
+    plant_regrow_delay: int = 5
+    competitor_intro_step: int = 30
+    initial_competitors: int = 30
+    terrain_weights: Optional[Dict[str, float]] = None
+    prey_params: Optional[SpeciesParams] = None
+    predator_params: Optional[SpeciesParams] = None
+    competitor_params: Optional[SpeciesParams] = None
+    learning_enabled: bool = True
+    seed: int = 42
+    max_steps: int = 2000
+    data_interval: int = 1
+    max_population: Optional[int] = None
+    max_population_per_species: Optional[int] = None
+
+
 class SimpleScheduler:
     def __init__(self, model: Model):
         self.model = model
@@ -756,7 +778,78 @@ def compute_ess(df: pd.DataFrame, max_resource: int) -> float:
     return float((pop_stability + resource_sustainability + survival) / 3.0)
 
 
-def run_simulation() -> None:
+def _coerce_config(config: SimulationConfig | Dict) -> SimulationConfig:
+    if isinstance(config, SimulationConfig):
+        return config
+    if isinstance(config, dict):
+        return SimulationConfig(**config)
+    raise ValueError("config must be a SimulationConfig or dict")
+
+
+def _validate_config(config: SimulationConfig) -> None:
+    if config.width <= 0 or config.height <= 0:
+        raise ValueError("width and height must be positive")
+    if config.max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if config.data_interval <= 0:
+        raise ValueError("data_interval must be positive")
+    if config.data_interval > config.max_steps:
+        raise ValueError("data_interval must be <= max_steps")
+    if config.competitor_intro_step < 0 or config.competitor_intro_step > config.max_steps:
+        raise ValueError("competitor_intro_step out of bounds")
+    if config.initial_plants < 0 or config.initial_prey < 0 or config.initial_predators < 0:
+        raise ValueError("initial species counts must be non-negative")
+    if config.terrain_weights is not None:
+        for key, value in config.terrain_weights.items():
+            if key not in TERRAIN_TYPES:
+                raise ValueError(f"invalid terrain type: {key}")
+            if value < 0:
+                raise ValueError("terrain weights must be non-negative")
+        if sum(config.terrain_weights.values()) <= 0:
+            raise ValueError("terrain_weights must sum to > 0")
+
+
+def _build_model(config: SimulationConfig) -> EcosystemModel:
+    return EcosystemModel(
+        width=config.width,
+        height=config.height,
+        initial_plants=config.initial_plants,
+        initial_prey=config.initial_prey,
+        initial_predators=config.initial_predators,
+        plant_regrow_delay=config.plant_regrow_delay,
+        prey_params=config.prey_params,
+        predator_params=config.predator_params,
+        competitor_params=config.competitor_params,
+        competitor_intro_step=config.competitor_intro_step,
+        initial_competitors=config.initial_competitors,
+        terrain_weights=config.terrain_weights,
+        learning_enabled=config.learning_enabled,
+        seed=config.seed,
+        max_steps=config.max_steps,
+        max_population=config.max_population,
+        max_population_per_species=config.max_population_per_species,
+    )
+
+
+def run_simulation(config: SimulationConfig | Dict) -> Dict:
+    config = _coerce_config(config)
+    _validate_config(config)
+    model = _build_model(config)
+    df = model.run_model()
+    if config.data_interval > 1 and not df.empty:
+        df = df.iloc[:: config.data_interval].reset_index(drop=True)
+
+    time_series = df.to_dict(orient="records")
+    ess = compute_ess(df, max_resource=model.initial_plants) if not df.empty else 0.0
+    return {
+        "config": config,
+        "time_series": time_series,
+        "extinction_steps": model.extinction_step,
+        "ess": ess,
+    }
+
+
+def run_simulation_with_plots() -> None:
     model = EcosystemModel()
     df = model.run_model()
     df.to_csv("ecosystem_results.csv", index=False)
@@ -1104,4 +1197,4 @@ if __name__ == "__main__":
             show_population_plot=not args.no_pop_plot,
         )
     else:
-        run_simulation()
+        run_simulation_with_plots()
